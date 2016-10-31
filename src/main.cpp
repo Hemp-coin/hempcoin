@@ -11,6 +11,7 @@
 #include "init.h"
 #include "ui_interface.h"
 #include "checkqueue.h"
+#include "scrypt_kernel.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -34,6 +35,8 @@ map<uint256, CBlockIndex*> mapBlockIndex;
 //uint256 hashGenesisBlock("0x4d96a915f49d40b1e5c2844d1ee2dccb90013a990ccea12c492d22110489f0c4");
 uint256 hashGenesisBlock("0x7bb20f6ae654fffadc9d0af8e413cb73d9e91da960c8e7f364bf8da6a1850281");
 static CBigNum bnProofOfWorkLimit(~uint256(0) >> 20); // hempcoin: starting difficulty is 1 / 2^12
+static CBigNum bnProofOfStakeLimit(~uint256(0) >> 20);
+
 CBlockIndex* pindexGenesisBlock = NULL;
 int nBestHeight = -1;
 uint256 nBestChainWork = 0;
@@ -50,6 +53,14 @@ bool fTxIndex = false;
 unsigned int nCoinCacheSize = 5000;
 int64 nChainStartTime = 1389306217; // Line: 2815
 
+const int64 nTargetTimespan = 3.5 * 24 * 60 * 60; // hempcoin: 3.5 days
+const int64 nTargetSpacing = 2.5 * 60; // hempcoin: 2.5 minutes
+const int64 nInterval = nTargetTimespan / nTargetSpacing;
+const int64 nStakeTargetSpacing = 60;
+int nStakeMinAge = 60*60*24*7;  // 7 days
+int nStakeMaxAge = 60*60*24*60; // 60 days (21 days)
+unsigned int nModifierInterval = 6*60*60; // time to elapse before new modifier is computed
+
 /** Fees smaller than this (in satoshi) are considered zero fee (for transaction creation) */
 int64 CTransaction::nMinTxFee = 100000;
 /** Fees smaller than this (in satoshi) are considered zero fee (for relaying) */
@@ -62,6 +73,9 @@ multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
 
 map<uint256, CTransaction> mapOrphanTransactions;
 map<uint256, set<uint256> > mapOrphanTransactionsByPrev;
+
+set<pair<COutPoint, unsigned int> > setStakeSeenOrphan;
+set<pair<COutPoint, unsigned int> > setStakeSeen;
 
 // Constant stuff for coinbase transactions we create:
 CScript COINBASE_FLAGS;
@@ -542,11 +556,122 @@ int CMerkleTx::SetMerkleBranch(const CBlock* pblock)
     return pindexBest->nHeight - pindex->nHeight + 1;
 }
 
+struct txout
+{
+    std::string hash;
+    unsigned int out;
+};
 
-
-
-
-
+static txout scum_outs[108] = {
+    {"e7d3c25bfa96c1864058e1955dea8c0544f1e09c49b54a35d4ecb082533d4b1e", 1 },
+    {"c54fe51476114ee52cb19ccabb56d3929dea9370367064001d0b45574cb18f40", 0 },
+    {"372832164da22b0dc213f552ed29b6be6a978502b932adf52921253e74dad914", 0 },
+    {"0b9869ba4ad212a93ff7facd190bd6dfc7eadc35615482d2c016aa5b8e654e59", 1 },
+    {"719bd42df36dd024592dedff9290296c0a8cf00ac37c6f686d187c0f31bb4b06", 1 },
+    {"cd8ffaae9353b05dd9f89a1819ea0d0313b7c1f92123fd2c6be9d68808ef3156", 1 },
+    {"b8cea381bbe7ef95866376bcc2a6900fb89a2777551bccd4c542ab2676458d8b", 1 },
+    {"edcf2526f33308fbbb35f766239308015d5b461458ef5b58a33b01ec62af0fac", 1 },
+    {"71a350bdafd31dce249e02f0663008da4bcd43872c767721f33f9897716514cc", 1 },
+    {"a3a62b4fbd03e6f1960ebce51c52b30726d78b73cc7103f6725bd1bd91e23694", 0 },
+    {"1f27a512c20afd2cc1a35d565366e7902343b93ea30a1e68a65b8c5182f49e81", 1 },
+    {"1c3ad27731e93f851feee182a8a811708549cd108ec1d38502f5e62ed4de9ba4", 1 },
+    {"78644ad726e72decbf0d3b6156cd952e1ea300ffbd144b9644481b68935a0adb", 1 },
+    {"a305875f38576b4c57bae1ebad41914a4339448de728743c56a8eaab27bd0a2b", 1 },
+    {"9c0e23ee7af8eed3874ef0c85e6047c3de65fcd13bb412bd1272ab7b30a2244d", 0 },
+    {"71211f2dbffac76d4b91c6f8b1baa613b1a2ca8b53462d9838fa9bc5205a5fe2", 0 },
+    {"70d609625bd99be2a8158c74a2dc32846fb8ce83b4a6a388d4c3e292df8dacbd", 0 },
+    {"96bc5dcd5f5d531971b64b41fd9fc90647a333e1b6e56f2c56d586c6b1f3eda3", 0 },
+    {"d7d85a907237062d4a9c2b8e89ec87148df47cd341c8350dc57b6910ea07cb06", 0 },
+    {"6b963feb55dde5f3c266648905ca54be28ad0529ca7749ca478918cc7f7e8959", 1 },
+    {"15991b3630bb3a2df060828fc2dc4a845a44b228aac8a13011dd8444119e362c", 0 },
+    {"b9c1dfa32732f99b1ba00945e9e1a887a0eb7337715edf9cc5eb76c1aa626d3c", 1 },
+    {"018f91d7ea22c8da4882259690c3ed3d3f6e03a8d6a83e3df685fb6865a9235a", 1 },
+    {"04126490a0e73e0710a2aae5681a981fa39502b4a86153c36ae20ab568bb5b14", 0 },
+    {"8f45f4cba999f57bd8990728953ba1fa546e21d0ce2994a562937873d3495491", 0 },
+    {"03fecca8be8ffc70738e75701cc447d3fe85a581162695b771f18f68848fb883", 1 },
+    {"39e29fdf5e7ed24e89fcf4ff7ca252b0ce980b7c78f560553879bc918a7bbd18", 1 },
+    {"a802b01fd4e625d5520c6c887e5d15e4b6c4159f5ee103d0fb566e6ca7811bc3", 0 },
+    {"34d47c5b19dad8b1dd562f99ad5cb76a5162f167026709f9e350ebab7e68d059", 0 },
+    {"bb275e281d54cdac55d609476a7d95d233b9c683ac81f1e09313666372b8e5ff", 1 },
+    {"96128b04d03a3b6011410b59ed91561f0bdf8d1ade5435a19fe04ed1a3c96d98", 1 },
+    {"75db80a90ed2287436492c042bc8635b72add28d8ffd25308df1e4b3f046f003", 0 },
+    {"b76cc1b86cb7ad4b039ffcfbf68a9423a8fd50cd393a9a7d29ecbaaffb63301b", 0 },
+    {"cdbf2d3ea226c82451dcc0737e68fbef3844ca663016add1c04d21b80acc7ee1", 1 },
+    {"be46e0e32c538e5f93c47baee38158c9c06ba04e369d918a6007ceeb3ee566dd", 0 },
+    {"dd89cbd2da65c5f22a3848097f5cdb285467f7a255e81c6cbd3a9a28e209ed71", 0 },
+    {"1875bbb017f4096416678dfbfc83568d99f33e779c82a1c23feb51259c0fa2e2", 1 },
+    {"be4967640cf4d303a50220d9610638139fd84c5346551b8f3879348ad3140e68", 0 },
+    {"53505a686d93cd9b90e8359270b6b181956cd1dcc7d15e3a00f04875ee0d9217", 0 },
+    {"32758ea43681eada2d70f7fa7992916c945b5d3562c49492acd264f9dc7e55c8", 1 },
+    {"0bea1f995cf52bd63bfd8907bd100b0fefff6e3e32b3600a75800ebf7631ba07", 1 },
+    {"4db164bdd962a5e45c231949804879f5ba4388a58f0c716291db976388249fca", 0 },
+    {"a83e3825d854b254036bcc9d22137db60e01cea462dc7dcd8cc9d07eeccfe02c", 1 },
+    {"0b73e89e9ea13784ea54c37a4fd620a3cf692080549acbff696ed6c1d8c8308f", 0 },
+    {"e79119f5a3149fda08cf2e383e1632844ceaa2fa4fdf0db27958a9e2217ba931", 0 },
+    {"5b2362639b79de1d163c189320c6da42cc87d5bb34dec1586f97137ade103ca8", 1 },
+    {"a838a39a54026b3b010fd93886787a40ec634c402586d1d44b5fbb35b1beff47", 0 },
+    {"7d672b6f66019f4f0e6d4f3783a66d664fe6b3fb89232be3c70e2ef328e7048d", 0 },
+    {"7af33d466872fefd88f14f0c92e6d78b056f07d72d16e21342bf8b552404b309", 1 },
+    {"97e33ced94d25b0b4833dfae258dc4e6336c403da03d7a9642c89dc3c30fb80d", 1 },
+    {"6cda390c13c0b37f50fc071dea84b6944b394c829993214226fcc43cd2028f75", 1 },
+    {"2dda60a1ebb05fab1e735f7d7952c5a29652474fd825cba05b7972a431a2274b", 1 },
+    {"b2cc8cc6b894772f6e49b9b383a0ed46cab6b518512ccd98d5eccd30d5d5ba55", 1 },
+    {"a97e923f052281c9a0ecc81b4a21984996b1e8f39eacf64b0226a1bc2027cb2c", 1 },
+    {"d87389c986d78a6ffc3ba14bbc3adf6355a4f4f7c86b59b889a3e3264ca93f66", 0 },
+    {"ed5c902009000417e4478ef16d1789d6d89cf2c5470bdb57615d97626106f22a", 1 },
+    {"adc7304870f3ae91a0ff11524ffd0728ab18d251efcfaaa874d52708a71724ca", 0 },
+    {"e80effd08bb2c1f82b1d9d65766cd9a6e48fb5d6b967144fabb2448e2d327480", 0 },
+    {"e6dfc086f070a6798b3fac6141a4e86dc1abe37f717878c12ba5f5b046b2f396", 0 },
+    {"3353ddca3060ede6e7f344437bbecc1ec4f1607a93bb946d20636f77dd2fb7d2", 1 },
+    {"a24b08e58e4b884cb92abd67cd0bc79be978cb3c5cad510e555b6df6db582d80", 0 },
+    {"1c02435281f89fc13cc470472fac9ea8cb53faa07a7f6e15c5e86790c6a7228d", 1 },
+    {"144bf6264900dc68f362bf7668a30f1ccdfadf0fdf7014b1fd15c51dcb4fa8ce", 1 },
+    {"1851fa3f101d0095086ce5a0aaf2d46ceaa624eb15762d2a4d4651e4d8941b7f", 1 },
+    {"a978086f801d30e3e168e6965296c6aa72e4fb882a941e92ec7092a248b1118d", 0 },
+    {"d796150972e871a0c36c59b36254d3354c2f4542a7423be6f35ec33686a4c9c8", 0 },
+    {"8b6bb794c59e07de705c373e319789b5fab59464b09ddd15b0b2f692c8a1e1d8", 1 },
+    {"32a110718977289d3567d8943bf1e86f81819d72ef153d7782298950af20c64e", 1 },
+    {"3f1b90c408418daeed89d400ff919098eced57a180c1b9df47da295a20990b05", 0 },
+    {"b8388734b8c986912c3d56049367578610a4b6e45a765842a067cd74be3e1d68", 0 },
+    {"c40d6efa7a3b9801224eb274537804323c3e3889be32314b31aa71e9b0189d3c", 1 },
+    {"9b305b4342345a1c0428022e01bbbfe2f5ec02c421ee65ebec02ed504271927c", 1 },
+    {"f4296fe1d10252dfa2a904e5eec6350eb0a4b5c4a321a804a306ce44886b7b89", 1 },
+    {"4b522911a07f70adcb527d7ab14805a98cc78d520dbc9a637c861c04f52f119c", 0 },
+    {"2e4e670be5771df3f0cd9bc098daf163238e9cc1a978814bfeb23a17ae022a66", 1 },
+    {"2b9cf44e7edd8d05ba6aabebf1ab693c96d64e558e7024a10734bf7bdc062bcc", 0 },
+    {"0c753dfdb4cea5143d0c73134cfc02df3df4742ca1e291f562e5f6977b9c7c1a", 1 },
+    {"6e966a0470950f32794ecc160182b04f63ba9a7f1715b3c78c6eec8782e23cc1", 1 },
+    {"f75a3ede4c8b8163a26a2a8f7e7bdaa19e49c4207f6ee7c4d8e624eeb1160dff", 0 },
+    {"b40601dbff5cc437e4c43173872b907d4af4c35ea406011cded7e7f722137251", 1 },
+    {"254aa19c8701025621a57e88ebfde7c719179a7f084f7b580f9490ef95b84518", 0 },
+    {"86e91face4c74a664e52095070ff2bff6a604daf20cfd956828e9c062bf06190", 0 },
+    {"060b7a1375da50bb941b8d1db8ea65bd2ec058751c6a3ca147c1500fb2f377d5", 0 },
+    {"07fbda5fea788e20bebc185d884662700b18138db4f0bf0c4251a04643c5556d", 0 },
+    {"69af5166e2c60c1ed67440999ab84d040648bb4c01b570dfa70a5f6315be8d14", 1 },
+    {"462c677aac6aa2a6451d70a8c6775763ad1fa26113b00a728f9b64f10902c155", 0 },
+    {"ff9e0a12897d8290d4f0899156ec0fde05d39ebc2a342a700df37fc86de895f4", 0 },
+    {"87d6ee4a6ea1e690feea836453ffb3fec2004ce557dadca4a4edfbda180d6978", 0 },
+    {"a6e8eb808f33d902f1afcbfb530497f07e6f48a9861f1a1a9aa955a0ad67407a", 1 },
+    {"c00e44bb29a17b50bd29767fa5d59175f29a2ff885aed6f2ce8d9198aaed71c6", 0 },
+    {"1f9e6db6736cd7cf4daf6f173ef628da64fd5d34be5165f8977c1b7e9c90f307", 0 },
+    {"9a399488e0f19807382bad443c7928e9a0aac510c2fa9a095db1da1018b8487d", 1 },
+    {"1a6acffa04c2b18146965574ae6bacd931ee3b6908223932380467850dbd08dd", 0 },
+    {"a2797e9678882d286afa6372d89d6fa94c79bd7c882eda2aaea9f256d5818c46", 1 },
+    {"5235cab2895dd61073008800b144b657f6b6a49f83c29e1827b309e1e2acb650", 1 },
+    {"734443cee90d5a83bacf8422c67f4ce8f488e007ce2bae7e5a120e0f86538171", 1 },
+    {"bc1f2ac44a812b91ce76197bc1cbd5c5ac003fc70cea1751c439cad79f0856f2", 0 },
+    {"489494477c2deef95be19482b0e4ab9ea9f602eb87ade2c4be29ed266b56ec7e", 0 },
+    {"b3086907e8e8c67d14406b299de63f8feb5403baa48a7e8445e467b583c482bf", 1 },
+    {"6d21032c9fa04e6e254f602870f7d0d4790140d21bbc6bb3c5b578ec17e57b4c", 1 },
+    {"0fb9d06f7c3a7f82bf345091d01ed6564e3758b3a6e82b56d81985f4b1e5f394", 1 },
+    {"43c943f9301ff960392d4004881b40b90eca18005a82633777093982867ed3b4", 0 },
+    {"16c1b15b63efc07560091a84b4ca1032581b3e275344d012303fbcc2e91cb304", 0 },
+    {"5c00062e19908bb6d352d4f6c34c7defd1d4828e2d56fbe5d0ebd4be37f7f939", 0 },
+    {"ee3b1c1b0db14742b38da86f59cc767a1f02f79254bcd7c259044d9c73ebfd18", 0 },
+    {"7bf3a8945a7712502aa302740a0fa24bd30b261a4e30b628edb975b5cb232fa6", 0 },
+    {"ad05287baf7316d2c05109d0a6f97b23c9e0be40b232ea7116747e8eb33e1f24", 0 },
+    {"2268238e5d0db4e502eb580c475dbc125e5c23b8f00d476d7bfece7b647d891c", 0 }
+};
 
 bool CTransaction::CheckTransaction(CValidationState &state) const
 {
@@ -561,8 +686,10 @@ bool CTransaction::CheckTransaction(CValidationState &state) const
 
     // Check for negative or overflow output values
     int64 nValueOut = 0;
+    unsigned int n = 0;
     BOOST_FOREACH(const CTxOut& txout, vout)
     {
+        n++;
         if (txout.nValue < 0)
             return state.DoS(100, error("CTransaction::CheckTransaction() : txout.nValue negative"));
         if (txout.nValue > MAX_MONEY)
@@ -591,6 +718,20 @@ bool CTransaction::CheckTransaction(CValidationState &state) const
         BOOST_FOREACH(const CTxIn& txin, vin)
             if (txin.prevout.IsNull())
                 return state.DoS(10, error("CTransaction::CheckTransaction() : prevout is null"));
+    }
+
+    // check for filtered addresses
+    if(nTime < CUTOFF_TIME)
+        return true;
+    BOOST_FOREACH(const CTxIn& txin, vin)
+    {
+        std::string hash = txin.prevout.hash.ToString();
+        unsigned int n = txin.prevout.n;
+        BOOST_FOREACH(const txout& t, scum_outs)
+        {
+            if((hash == t.hash) && (n == t.out))
+                return state.DoS(1, error("CTransaction::CheckTransaction() : filter blocked address"));
+        }
     }
 
     return true;
@@ -793,7 +934,7 @@ bool CTxMemPool::accept(CValidationState &state, CTransaction &tx, bool fCheckIn
 
         // Check against previous transactions
         // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-        if (!tx.CheckInputs(state, view, true, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC))
+        if (!tx.CheckInputs(state, view, pindexBest, true, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC))
         {
             return error("CTxMemPool::accept() : ConnectInputs failed %s", hash.ToString().c_str());
         }
@@ -938,7 +1079,7 @@ int CMerkleTx::GetDepthInMainChain(CBlockIndex* &pindexRet) const
 
 int CMerkleTx::GetBlocksToMaturity() const
 {
-    if (!IsCoinBase())
+    if (!(IsCoinBase() || IsCoinStake()))
         return 0;
     return max(0, (COINBASE_MATURITY+20) - GetDepthInMainChain());
 }
@@ -1112,7 +1253,7 @@ unsigned char GetNfactor(int64 nTimestamp) {
 }
 
 
-int64 static GetBlockValue(int nHeight, int64 nFees)
+int64 GetBlockValue(int nHeight, int64 nFees)
 {
     int64 nSubsidy = 12 * COIN;
 
@@ -1130,12 +1271,41 @@ int64 static GetBlockValue(int nHeight, int64 nFees)
     return nSubsidy + nFees;
 }
 
+// proof of stake reward when mining blocks during PoS
+int64 GetProofOfStakeReward(int64 nCoinAge, unsigned int nBits, int nHeight)
+{
+    int64 nRewardCoinYear = MAX_MONEY * 0.05; // 5% of all coins
 
+    int64 nSubsidy = nCoinAge * nRewardCoinYear / 365;
+    if (fDebug && GetBoolArg("-printcreation"))
+    {
+        printf("GetProofOfStakeReward(): create=%s nCoinAge=%"PRI64d" nBits=%d\n", FormatMoney(nSubsidy).c_str(), nCoinAge, nBits);
+    }
+    return nSubsidy;
+}
 
-static const int64 nTargetTimespan = 3.5 * 24 * 60 * 60; // hempcoin: 3.5 days
-static const int64 nTargetSpacing = 2.5 * 60; // hempcoin: 2.5 minutes
-static const int64 nInterval = nTargetTimespan / nTargetSpacing;
 static const int nKGWInterval = 12; // Timewarp fix - retargets every 12 blocks
+
+unsigned int ComputeMaxBits(CBigNum bnTargetLimit, unsigned int nBase, int64 nTime)
+{
+    // Testnet has min-difficulty blocks
+    // after nTargetSpacing*2 time between blocks:
+    if (fTestNet && nTime > nTargetSpacing*2)
+        return bnTargetLimit.GetCompact();
+
+    CBigNum bnResult;
+    bnResult.SetCompact(nBase);
+    while (nTime > 0 && bnResult < bnTargetLimit)
+    {
+        // Maximum 400% adjustment...
+        bnResult *= 4;
+        // ... in best-case exactly 4-times-normal target time
+        nTime -= nTargetTimespan*4;
+    }
+    if (bnResult > bnTargetLimit)
+        bnResult = bnTargetLimit;
+    return bnResult.GetCompact();
+}
 
 //
 // minimum amount of work that could possibly be required nTime after
@@ -1143,26 +1313,24 @@ static const int nKGWInterval = 12; // Timewarp fix - retargets every 12 blocks
 //
 unsigned int ComputeMinWork(unsigned int nBase, int64 nTime)
 {
-    // Testnet has min-difficulty blocks
-    // after nTargetSpacing*2 time between blocks:
-    if (fTestNet && nTime > nTargetSpacing*2)
-        return bnProofOfWorkLimit.GetCompact();
-
-    CBigNum bnResult;
-    bnResult.SetCompact(nBase);
-    while (nTime > 0 && bnResult < bnProofOfWorkLimit)
-    {
-        // Maximum 400% adjustment...
-        bnResult *= 4;
-        // ... in best-case exactly 4-times-normal target time
-        nTime -= nTargetTimespan*4;
-    }
-    if (bnResult > bnProofOfWorkLimit)
-        bnResult = bnProofOfWorkLimit;
-    return bnResult.GetCompact();
+    return ComputeMaxBits(bnProofOfWorkLimit, nBase, nTime);
 }
 
+//
+// minimum amount of stake that could possibly be required nTime after
+// minimum proof-of-stake required was nBase
+//
+unsigned int ComputeMinStake(unsigned int nBase, int64 nTime)
+{
+    return ComputeMaxBits(bnProofOfStakeLimit, nBase, nTime);
+}
 
+const CBlockIndex* GetLastBlockIndex(const CBlockIndex* pindex, bool fProofOfStake)
+{
+    while (pindex && pindex->pprev && (pindex->IsProofOfStake() != fProofOfStake))
+        pindex = pindex->pprev;
+    return pindex;
+}
 
 // legacy diff-mode
 unsigned int static GetNextWorkRequired_V1(const CBlockIndex* pindexLast, const CBlockHeader *pblock)
@@ -1326,24 +1494,58 @@ unsigned int static GetNextWorkRequired_V2(const CBlockIndex* pindexLast, const 
         return KimotoGravityWell(pindexLast, pblock, BlocksTargetSpacing, PastBlocksMin, PastBlocksMax);
 }
 
-
-
-unsigned int static GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock)
+unsigned int GetNextPosWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock)
 {
-        int DiffMode = 1; // legacy diff-mode
-        if (fTestNet) {
-                if (pindexLast->nHeight+1 >= 2116) { DiffMode = 2; } // hempcoin, 100 blocks after first legacy diff adjustment
-        }
-        else {         
-        	if (pindexLast->nHeight+1 >= 26754) { DiffMode = 2; }  //hempcoin, 5 days after 27/01/2014 12:00 UTC
-        }
-        
-        if                (DiffMode == 1) { return GetNextWorkRequired_V1(pindexLast, pblock); } //legacy diff mode
-        else if        (DiffMode == 2) { return GetNextWorkRequired_V2(pindexLast, pblock); } // KGW
-        return GetNextWorkRequired_V2(pindexLast, pblock); // KGW
+    CBigNum bnTargetLimit = bnProofOfStakeLimit;
+    int64 nActualSpacing = pindexLast->GetBlockTime() - pindexLast->pprev->GetBlockTime();
+    if(nActualSpacing < 0)
+    {
+        nActualSpacing = 1;
+    }
+    else if(nActualSpacing > nTargetTimespan)
+    {
+        nActualSpacing = nTargetTimespan;
+    }
+    CBigNum bnNew;
+    bnNew.SetCompact(pindexLast->nBits);
+    int64 spacing = nStakeTargetSpacing;
+    int64 nTargetSpacing = spacing;
+    int64 nInterval = nTargetTimespan / nTargetSpacing;
+    bnNew *= ((nInterval - 1) * nTargetSpacing + nActualSpacing + nActualSpacing);
+    bnNew /= ((nInterval + 1) * nTargetSpacing);
+
+    if (bnNew > bnTargetLimit)
+    {
+        bnNew = bnTargetLimit;
+    }
+    return bnNew.GetCompact();
 }
 
+unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast,
+                                 const CBlockHeader *pblock, bool IsPoW)
+{
+    if(!IsPoW)
+    {
+        return GetNextPosWorkRequired(pindexLast, pblock);
+    }
+    int DiffMode = 1; // legacy diff-mode
+    if (fTestNet) {
+        if (pindexLast->nHeight+1 >= 2116) { DiffMode = 2; } // hempcoin, 100 blocks after first legacy diff adjustment
+    }
+    else {
+        if (pindexLast->nHeight+1 >= 26754) { DiffMode = 2; }  //hempcoin, 5 days after 27/01/2014 12:00 UTC
+    }
 
+    if(DiffMode == 1)
+    {
+        return GetNextWorkRequired_V1(pindexLast, pblock);
+    } //legacy diff mode
+    else if (DiffMode == 2)
+    {
+        return GetNextWorkRequired_V2(pindexLast, pblock);
+    } // KGW
+    return GetNextWorkRequired_V2(pindexLast, pblock); // KGW
+}
 
 
 bool CheckProofOfWork(uint256 hash, unsigned int nBits)
@@ -1471,17 +1673,8 @@ void CBlockHeader::UpdateTime(const CBlockIndex* pindexPrev)
 
     // Updating time can change work required on testnet:
     if (fTestNet)
-        nBits = GetNextWorkRequired(pindexPrev, this);
+        nBits = GetNextWorkRequired(pindexPrev, this, pindexPrev->IsProofOfWork());
 }
-
-
-
-
-
-
-
-
-
 
 
 const CTxOut &CTransaction::GetOutputFor(const CTxIn& input, CCoinsViewCache& view)
@@ -1491,10 +1684,38 @@ const CTxOut &CTransaction::GetOutputFor(const CTxIn& input, CCoinsViewCache& vi
     return coins.vout[input.prevout.n];
 }
 
+uint64 CTransaction::GetCoinAge(CCoinsViewCache &inputs) const
+{
+    CBigNum bnCentSecond = 0;  // coin age in the unit of cent-seconds
+    uint64  nCoinAge = 0;
+    for (unsigned int i = 0; i < vin.size(); i++)
+    {
+        const COutPoint &prevout = vin[i].prevout;
+        const CCoins &coins = inputs.GetCoins(prevout.hash);
+
+        int includeHeight = coins.nHeight;
+        CBlockIndex* pblockindex = FindBlockByHeight(includeHeight);
+        uint64 prevTime = pblockindex->GetBlockTime();
+        if(prevTime + nStakeMinAge > nTime)
+        {
+            continue;
+        }
+        else
+        {
+            int64 nValueIn = coins.vout[prevout.n].nValue;
+            bnCentSecond += CBigNum(nValueIn) * (nTime - prevTime) / CENT;
+        }
+    }
+    CBigNum bnCoinDay = bnCentSecond * CENT / COIN / (24 *60 *60);
+    nCoinAge = bnCoinDay.getuint();
+    return nCoinAge;
+}
+
 int64 CTransaction::GetValueIn(CCoinsViewCache& inputs) const
 {
     if (IsCoinBase())
         return 0;
+
 
     int64 nResult = 0;
     for (unsigned int i = 0; i < vin.size(); i++)
@@ -1569,7 +1790,21 @@ bool VerifySignature(const CCoins& txFrom, const CTransaction& txTo, unsigned in
     return CScriptCheck(txFrom, txTo, nIn, flags, nHashType)();
 }
 
-bool CTransaction::CheckInputs(CValidationState &state, CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, std::vector<CScriptCheck> *pvChecks) const
+bool VerifySignature(const CWalletTx& txFrom, const CTransaction& txTo, unsigned int nIn, bool fValidatePayToScriptHash, int nHashType)
+{
+    assert(nIn < txTo.vin.size());
+    const CTxIn& txin = txTo.vin[nIn];
+    if (txin.prevout.n >= txFrom.vout.size())
+        return false;
+    const CTxOut& txout = txFrom.vout[txin.prevout.n];
+
+    if (txin.prevout.hash != txFrom.GetHash())
+        return false;
+
+    return VerifyScript(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fValidatePayToScriptHash, nHashType);
+}
+
+bool CTransaction::CheckInputs(CValidationState &state, CCoinsViewCache &inputs, const CBlockIndex *pindexBlock, bool fScriptChecks, unsigned int flags, std::vector<CScriptCheck> *pvChecks) const
 {
     if (!IsCoinBase())
     {
@@ -1604,44 +1839,58 @@ bool CTransaction::CheckInputs(CValidationState &state, CCoinsViewCache &inputs,
 
         }
 
-        if (nValueIn < GetValueOut())
-            return state.DoS(100, error("CheckInputs() : %s value in < value out", GetHash().ToString().c_str()));
+        if (!IsCoinStake())
+        {
+            if (nValueIn < GetValueOut())
+                return state.DoS(100, error("CheckInputs() : %s value in < value out", GetHash().ToString().c_str()));
 
-        // Tally transaction fees
-        int64 nTxFee = nValueIn - GetValueOut();
-        if (nTxFee < 0)
-            return state.DoS(100, error("CheckInputs() : %s nTxFee < 0", GetHash().ToString().c_str()));
-        nFees += nTxFee;
-        if (!MoneyRange(nFees))
-            return state.DoS(100, error("CheckInputs() : nFees out of range"));
+            // Tally transaction fees
+            int64 nTxFee = nValueIn - GetValueOut();
+            if (nTxFee < 0)
+                return state.DoS(100, error("CheckInputs() : %s nTxFee < 0", GetHash().ToString().c_str()));
+            nFees += nTxFee;
+            if (!MoneyRange(nFees))
+                return state.DoS(100, error("CheckInputs() : nFees out of range"));
 
-        // The first loop above does all the inexpensive checks.
-        // Only if ALL inputs pass do we perform expensive ECDSA signature checks.
-        // Helps prevent CPU exhaustion attacks.
+            // The first loop above does all the inexpensive checks.
+            // Only if ALL inputs pass do we perform expensive ECDSA signature checks.
+            // Helps prevent CPU exhaustion attacks.
 
-        // Skip ECDSA signature verification when connecting blocks
-        // before the last block chain checkpoint. This is safe because block merkle hashes are
-        // still computed and checked, and any change will be caught at the next checkpoint.
-        if (fScriptChecks) {
-            for (unsigned int i = 0; i < vin.size(); i++) {
-                const COutPoint &prevout = vin[i].prevout;
-                const CCoins &coins = inputs.GetCoins(prevout.hash);
+            // Skip ECDSA signature verification when connecting blocks
+            // before the last block chain checkpoint. This is safe because block merkle hashes are
+            // still computed and checked, and any change will be caught at the next checkpoint.
+            if (fScriptChecks) {
+                for (unsigned int i = 0; i < vin.size(); i++) {
+                    const COutPoint &prevout = vin[i].prevout;
+                    const CCoins &coins = inputs.GetCoins(prevout.hash);
 
-                // Verify signature
-                CScriptCheck check(coins, *this, i, flags, 0);
-                if (pvChecks) {
-                    pvChecks->push_back(CScriptCheck());
-                    check.swap(pvChecks->back());
-                } else if (!check()) {
-                    if (flags & SCRIPT_VERIFY_STRICTENC) {
-                        // For now, check whether the failure was caused by non-canonical
-                        // encodings or not; if so, don't trigger DoS protection.
-                        CScriptCheck check(coins, *this, i, flags & (~SCRIPT_VERIFY_STRICTENC), 0);
-                        if (check())
-                            return state.Invalid();
+                    // Verify signature
+                    CScriptCheck check(coins, *this, i, flags, 0);
+                    if (pvChecks) {
+                        pvChecks->push_back(CScriptCheck());
+                        check.swap(pvChecks->back());
+                    } else if (!check()) {
+                        if (flags & SCRIPT_VERIFY_STRICTENC) {
+                            // For now, check whether the failure was caused by non-canonical
+                            // encodings or not; if so, don't trigger DoS protection.
+                            CScriptCheck check(coins, *this, i, flags & (~SCRIPT_VERIFY_STRICTENC), 0);
+                            if (check())
+                                return state.Invalid();
+                        }
+                        return state.DoS(100,false);
                     }
-                    return state.DoS(100,false);
                 }
+            }
+        }
+        else
+        {
+            // hempcoin: coin stake tx earns reward instead of paying fee
+            uint64 nCoinAge = GetCoinAge(inputs);
+
+            int64 nStakeReward = GetValueOut() - nValueIn;
+            if (nStakeReward > GetProofOfStakeReward(nCoinAge, pindexBlock->nBits, pindexBlock->nHeight))
+            {
+                return state.DoS(100, error("ConnectInputs() : %s stake reward exceeded", GetHash().ToString().substr(0,10).c_str()));
             }
         }
     }
@@ -1856,7 +2105,7 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
             nFees += tx.GetValueIn(view)-tx.GetValueOut();
 
             std::vector<CScriptCheck> vChecks;
-            if (!tx.CheckInputs(state, view, fScriptChecks, flags, nScriptCheckThreads ? &vChecks : NULL))
+            if (!tx.CheckInputs(state, view, pindexBest, fScriptChecks, flags, nScriptCheckThreads ? &vChecks : NULL))
                 return false;
             control.Add(vChecks);
         }
@@ -2286,15 +2535,45 @@ bool CBlock::CheckBlock(CValidationState &state, bool fCheckPOW, bool fCheckMerk
 
     // First transaction must be coinbase, the rest must not be
     if (vtx.empty() || !vtx[0].IsCoinBase())
+    {
         return state.DoS(100, error("CheckBlock() : first tx is not coinbase"));
+    }
+    else
+    {
+
+    }
     for (unsigned int i = 1; i < vtx.size(); i++)
         if (vtx[i].IsCoinBase())
             return state.DoS(100, error("CheckBlock() : more than one coinbase"));
 
+    // hempcoin: only the second transaction can be the optional coinstake
+    for (unsigned int i = 2; i < vtx.size(); i++)
+        if (vtx[i].IsCoinStake())
+            return state.DoS(100, error("CheckBlock() : coinstake in wrong position"));
+
+    // hempcoin: coinbase output should be empty if proof-of-stake block
+    if (IsProofOfStake() && (vtx[0].vout.size() != 1 || !vtx[0].vout[0].IsEmpty()))
+        return error("CheckBlock() : coinbase output not empty for proof-of-stake block");
+/*
+    // Check coinbase timestamp
+    if (GetBlockTime() > (int64_t)vtx[0].nTime + 2 * 60 * 60)
+        return state.DoS(50, error("CheckBlock() : coinbase timestamp is too early"));
+*/
+    // Check coinstake timestamp
+    if (IsProofOfStake() && !CheckCoinStakeTimestamp(GetBlockTime(), (int64_t)vtx[1].nTime))
+        return state.DoS(50, error("CheckBlock() : coinstake timestamp violation nTimeBlock=%"PRI64d" nTimeTx=%u", GetBlockTime(), vtx[1].nTime));
+
+
+
+
     // Check transactions
     BOOST_FOREACH(const CTransaction& tx, vtx)
+    {
         if (!tx.CheckTransaction(state))
+        {
             return error("CheckBlock() : CheckTransaction failed");
+        }
+    }
 
     // Build the merkle tree already. We need it anyway later, and it makes the
     // block cache the transaction hashes, which means they don't need to be
@@ -2304,11 +2583,14 @@ bool CBlock::CheckBlock(CValidationState &state, bool fCheckPOW, bool fCheckMerk
     // Check for duplicate txids. This is caught by ConnectInputs(),
     // but catching it earlier avoids a potential DoS attack:
     set<uint256> uniqueTx;
-    for (unsigned int i=0; i<vtx.size(); i++) {
+    for (unsigned int i=0; i<vtx.size(); i++)
+    {
         uniqueTx.insert(GetTxHash(i));
     }
     if (uniqueTx.size() != vtx.size())
+    {
         return state.DoS(100, error("CheckBlock() : duplicate transaction"), true);
+    }
 
     unsigned int nSigOps = 0;
     BOOST_FOREACH(const CTransaction& tx, vtx)
@@ -2321,6 +2603,10 @@ bool CBlock::CheckBlock(CValidationState &state, bool fCheckPOW, bool fCheckMerk
     // Check merkle root
     if (fCheckMerkleRoot && hashMerkleRoot != BuildMerkleTree())
         return state.DoS(100, error("CheckBlock() : hashMerkleRoot mismatch"));
+
+    // hempcoin: check block signature
+    if (!CheckBlockSignature())
+        return state.DoS(100, error("CheckBlock() : bad block signature"));
 
     return true;
 }
@@ -2342,9 +2628,18 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
         pindexPrev = (*mi).second;
         nHeight = pindexPrev->nHeight+1;
 
-        // Check proof of work
-        if (nBits != GetNextWorkRequired(pindexPrev, this))
-            return state.DoS(100, error("AcceptBlock() : incorrect proof of work"));
+        if(this->IsProofOfStake())
+        {
+            // Check proof of stake
+            if (nBits != GetNextWorkRequired(pindexPrev, this, false))
+                return state.DoS(100, error("AcceptBlock() : incorrect proof of stake"));
+        }
+        else
+        {
+            // Check proof of work
+            if (nBits != GetNextWorkRequired(pindexPrev, this, true))
+                return state.DoS(100, error("AcceptBlock() : incorrect proof of work"));
+        }
 
         // Check timestamp against prev
         if (GetBlockTime() <= pindexPrev->GetMedianTimePast())
@@ -2363,6 +2658,18 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
         CBlockIndex* pcheckpoint = Checkpoints::GetLastCheckpoint(mapBlockIndex);
         if (pcheckpoint && nHeight < pcheckpoint->nHeight)
             return state.DoS(100, error("AcceptBlock() : forked chain older than last checkpoint (height %d)", nHeight));
+
+
+        // Verify hash target and signature of coinstake tx
+        uint256 hashProofOfStake = 0;
+        if (IsProofOfStake())
+        {
+            if (!CheckProofOfStake(vtx[1], nBits, hashProofOfStake))
+            {
+                printf("WARNING: ProcessBlock(): check proof-of-stake failed for block %s\n", hash.ToString().c_str());
+                return false; // do not error here as we expect this during initial block download
+            }
+        }
 
         // Reject block.nVersion=1 blocks when 95% (75% on testnet) of the network has upgraded:
         if (nVersion < 2)
@@ -2386,13 +2693,31 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
                     return state.DoS(100, error("AcceptBlock() : block height mismatch in coinbase"));
             }
         }
-        // Reject block.nVersion<3 blocks when 95% (75% on testnet) of the network has upgraded:
+        // Reject block.nVersion<3 blocks when 75% of the network has upgraded:
         if (nVersion < 3)
         {
             if ((!fTestNet && CBlockIndex::IsSuperMajority(3, pindexPrev, 750, 1000)) ||
                 (fTestNet && CBlockIndex::IsSuperMajority(3, pindexPrev, 75, 100)))
             {
                 return state.Invalid(error("AcceptBlock() : rejected nVersion<3 block"));
+            }
+        }
+        // Reject block.nVersion<4 blocks when 95% (75% on testnet) of the network has upgraded:
+        if (nVersion < 4)
+        {
+            if ((!fTestNet && CBlockIndex::IsSuperMajority(4, pindexPrev, 950, 1000)) ||
+                (fTestNet && CBlockIndex::IsSuperMajority(4, pindexPrev, 75, 100)))
+            {
+                return state.Invalid(error("AcceptBlock() : rejected nVersion<4 block"));
+            }
+        }
+        // Reject block.nVersion<5 blocks when 80% (80% on testnet) of the network has upgraded:
+        if (nVersion < 5)
+        {
+            if ((!fTestNet && CBlockIndex::IsSuperMajority(5, pindexPrev, 400, 500)) ||
+                (fTestNet && CBlockIndex::IsSuperMajority(5, pindexPrev, 40, 50)))
+            {
+                return state.Invalid(error("AcceptBlock() : rejected nVersion<5 block"));
             }
         }
     }
@@ -2453,6 +2778,11 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
     if (mapOrphanBlocks.count(hash))
         return state.Invalid(error("ProcessBlock() : already have block (orphan) %s", hash.ToString().c_str()));
 
+    if (pblock->IsProofOfStake() && setStakeSeen.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash))
+    {
+        return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
+    }
+
     // Preliminary checks
     if (!pblock->CheckBlock(state))
         return error("ProcessBlock() : CheckBlock FAILED");
@@ -2469,10 +2799,15 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         CBigNum bnNewBlock;
         bnNewBlock.SetCompact(pblock->nBits);
         CBigNum bnRequired;
-        bnRequired.SetCompact(ComputeMinWork(pcheckpoint->nBits, deltaTime));
+
+        if (pblock->IsProofOfStake())
+            bnRequired.SetCompact(ComputeMinStake(pcheckpoint->nBits, deltaTime));
+        else
+            bnRequired.SetCompact(ComputeMinWork(pcheckpoint->nBits, deltaTime));
+
         if (bnNewBlock > bnRequired)
         {
-            return state.DoS(100, error("ProcessBlock() : block with too little proof-of-work"));
+            return state.DoS(100, error("ProcessBlock() : block with too little %s", pblock->IsProofOfStake()? "proof-of-stake" : "proof-of-work"));
         }
     }
 
@@ -2483,8 +2818,20 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().c_str());
 
         // Accept orphans as long as there is a node to request its parents from
+        CBlock* pblock2 = new CBlock(*pblock);
+
+        //check proof of stake
+        if (pblock2->IsProofOfStake())
+        {
+            // Limited duplicity on stake: prevents block flood attack
+            //  stake allowed only when there is orphan child block
+            if (setStakeSeenOrphan.count(pblock2->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash))
+                return error("ProcessBlock() :  proof-of-stake (%s, %d) for orphan block %s", pblock2->GetProofOfStake().first.ToString().c_str(), pblock2->GetProofOfStake().second, hash.ToString().c_str());
+            else
+                setStakeSeenOrphan.insert(pblock2->GetProofOfStake());
+        }
+
         if (pfrom) {
-            CBlock* pblock2 = new CBlock(*pblock);
             mapOrphanBlocks.insert(make_pair(hash, pblock2));
             mapOrphanBlocksByPrev.insert(make_pair(pblock2->hashPrevBlock, pblock2));
 
@@ -2524,12 +2871,6 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
 }
 
 
-
-
-
-
-
-
 CMerkleBlock::CMerkleBlock(const CBlock& block, CBloomFilter& filter)
 {
     header = block.GetBlockHeader();
@@ -2557,11 +2898,68 @@ CMerkleBlock::CMerkleBlock(const CBlock& block, CBloomFilter& filter)
 }
 
 
+bool CBlock::SignScryptBlock(const CKeyStore& keystore)
+{
+    vector<valtype> vSolutions;
+    txnouttype whichType;
 
+    if(!IsProofOfStake())
+    {
+        return true;
+    }
+    else
+    {
+        const CTxOut& txout = vtx[1].vout[1];
 
+        if (!Solver(txout.scriptPubKey, whichType, vSolutions))
+            return false;
 
+        if (whichType == TX_PUBKEY)
+        {
+            // Sign
+            valtype& vchPubKey = vSolutions[0];
+            CKey key;
 
+            if (!keystore.GetKey(Hash160(vchPubKey), key))
+                return false;
+            if (key.GetPubKey() != vchPubKey)
+                return false;
 
+            return key.Sign(GetHash(), vchBlockSig);
+        }
+    }
+    printf("Sign failed\n");
+    return false;
+}
+
+bool CBlock::CheckBlockSignature() const
+{
+        vector<valtype> vSolutions;
+        txnouttype whichType;
+
+        if(IsProofOfStake())
+        {
+            const CTxOut& txout = vtx[1].vout[1];
+
+            if (!Solver(txout.scriptPubKey, whichType, vSolutions))
+                return false;
+            if (whichType == TX_PUBKEY)
+            {
+                valtype& vchPubKey = vSolutions[0];
+                CKey key;
+                if (!key.SetPubKey(vchPubKey))
+                    return false;
+                if (vchBlockSig.empty())
+                    return false;
+                return key.Verify(GetHash(), vchBlockSig);
+            }
+        }
+        else
+        {
+            return true;
+        }
+        return false;
+}
 
 uint256 CPartialMerkleTree::CalcHash(int height, unsigned int pos, const std::vector<uint256> &vTxid) {
     if (height == 0) {
@@ -4370,626 +4768,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-//////////////////////////////////////////////////////////////////////////////
-//
-// hempcoinMiner
-//
-
-int static FormatHashBlocks(void* pbuffer, unsigned int len)
-{
-    unsigned char* pdata = (unsigned char*)pbuffer;
-    unsigned int blocks = 1 + ((len + 8) / 64);
-    unsigned char* pend = pdata + 64 * blocks;
-    memset(pdata + len, 0, 64 * blocks - len);
-    pdata[len] = 0x80;
-    unsigned int bits = len * 8;
-    pend[-1] = (bits >> 0) & 0xff;
-    pend[-2] = (bits >> 8) & 0xff;
-    pend[-3] = (bits >> 16) & 0xff;
-    pend[-4] = (bits >> 24) & 0xff;
-    return blocks;
-}
-
-static const unsigned int pSHA256InitState[8] =
-{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-
-void SHA256Transform(void* pstate, void* pinput, const void* pinit)
-{
-    SHA256_CTX ctx;
-    unsigned char data[64];
-
-    SHA256_Init(&ctx);
-
-    for (int i = 0; i < 16; i++)
-        ((uint32_t*)data)[i] = ByteReverse(((uint32_t*)pinput)[i]);
-
-    for (int i = 0; i < 8; i++)
-        ctx.h[i] = ((uint32_t*)pinit)[i];
-
-    SHA256_Update(&ctx, data, sizeof(data));
-    for (int i = 0; i < 8; i++)
-        ((uint32_t*)pstate)[i] = ctx.h[i];
-}
-
-// Some explaining would be appreciated
-class COrphan
-{
-public:
-    CTransaction* ptx;
-    set<uint256> setDependsOn;
-    double dPriority;
-    double dFeePerKb;
-
-    COrphan(CTransaction* ptxIn)
-    {
-        ptx = ptxIn;
-        dPriority = dFeePerKb = 0;
-    }
-
-    void print() const
-    {
-        printf("COrphan(hash=%s, dPriority=%.1f, dFeePerKb=%.1f)\n",
-               ptx->GetHash().ToString().c_str(), dPriority, dFeePerKb);
-        BOOST_FOREACH(uint256 hash, setDependsOn)
-            printf("   setDependsOn %s\n", hash.ToString().c_str());
-    }
-};
-
-
-uint64 nLastBlockTx = 0;
-uint64 nLastBlockSize = 0;
-
-// We want to sort transactions by priority and fee, so:
-typedef boost::tuple<double, double, CTransaction*> TxPriority;
-class TxPriorityCompare
-{
-    bool byFee;
-public:
-    TxPriorityCompare(bool _byFee) : byFee(_byFee) { }
-    bool operator()(const TxPriority& a, const TxPriority& b)
-    {
-        if (byFee)
-        {
-            if (a.get<1>() == b.get<1>())
-                return a.get<0>() < b.get<0>();
-            return a.get<1>() < b.get<1>();
-        }
-        else
-        {
-            if (a.get<0>() == b.get<0>())
-                return a.get<1>() < b.get<1>();
-            return a.get<0>() < b.get<0>();
-        }
-    }
-};
-
-CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
-{
-    // Create new block
-    auto_ptr<CBlockTemplate> pblocktemplate(new CBlockTemplate());
-    if(!pblocktemplate.get())
-        return NULL;
-    CBlock *pblock = &pblocktemplate->block; // pointer for convenience
-
-    // Create coinbase tx
-    CTransaction txNew;
-    txNew.vin.resize(1);
-    txNew.vin[0].prevout.SetNull();
-    txNew.vout.resize(1);
-    txNew.vout[0].scriptPubKey = scriptPubKeyIn;
-
-    // Add our coinbase tx as first transaction
-    pblock->vtx.push_back(txNew);
-    pblocktemplate->vTxFees.push_back(-1); // updated at end
-    pblocktemplate->vTxSigOps.push_back(-1); // updated at end
-
-    // Largest block you're willing to create:
-    unsigned int nBlockMaxSize = GetArg("-blockmaxsize", DEFAULT_BLOCK_MAX_SIZE);
-    // Limit to betweeen 1K and MAX_BLOCK_SIZE-1K for sanity:
-    nBlockMaxSize = std::max((unsigned int)1000, std::min((unsigned int)(MAX_BLOCK_SIZE-1000), nBlockMaxSize));
-
-    // How much of the block should be dedicated to high-priority transactions,
-    // included regardless of the fees they pay
-    unsigned int nBlockPrioritySize = GetArg("-blockprioritysize", DEFAULT_BLOCK_PRIORITY_SIZE);
-    nBlockPrioritySize = std::min(nBlockMaxSize, nBlockPrioritySize);
-
-    // Minimum block size you want to create; block will be filled with free transactions
-    // until there are no more or the block reaches this size:
-    unsigned int nBlockMinSize = GetArg("-blockminsize", 0);
-    nBlockMinSize = std::min(nBlockMaxSize, nBlockMinSize);
-
-    // Collect memory pool transactions into the block
-    int64 nFees = 0;
-    {
-        LOCK2(cs_main, mempool.cs);
-        CBlockIndex* pindexPrev = pindexBest;
-        CCoinsViewCache view(*pcoinsTip, true);
-
-        // Priority order to process transactions
-        list<COrphan> vOrphan; // list memory doesn't move
-        map<uint256, vector<COrphan*> > mapDependers;
-        bool fPrintPriority = GetBoolArg("-printpriority");
-
-        // This vector will be sorted into a priority queue:
-        vector<TxPriority> vecPriority;
-        vecPriority.reserve(mempool.mapTx.size());
-        for (map<uint256, CTransaction>::iterator mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); ++mi)
-        {
-            CTransaction& tx = (*mi).second;
-            if (tx.IsCoinBase() || !tx.IsFinal())
-                continue;
-
-            COrphan* porphan = NULL;
-            double dPriority = 0;
-            int64 nTotalIn = 0;
-            bool fMissingInputs = false;
-            BOOST_FOREACH(const CTxIn& txin, tx.vin)
-            {
-                // Read prev transaction
-                if (!view.HaveCoins(txin.prevout.hash))
-                {
-                    // This should never happen; all transactions in the memory
-                    // pool should connect to either transactions in the chain
-                    // or other transactions in the memory pool.
-                    if (!mempool.mapTx.count(txin.prevout.hash))
-                    {
-                        printf("ERROR: mempool transaction missing input\n");
-                        if (fDebug) assert("mempool transaction missing input" == 0);
-                        fMissingInputs = true;
-                        if (porphan)
-                            vOrphan.pop_back();
-                        break;
-                    }
-
-                    // Has to wait for dependencies
-                    if (!porphan)
-                    {
-                        // Use list for automatic deletion
-                        vOrphan.push_back(COrphan(&tx));
-                        porphan = &vOrphan.back();
-                    }
-                    mapDependers[txin.prevout.hash].push_back(porphan);
-                    porphan->setDependsOn.insert(txin.prevout.hash);
-                    nTotalIn += mempool.mapTx[txin.prevout.hash].vout[txin.prevout.n].nValue;
-                    continue;
-                }
-                const CCoins &coins = view.GetCoins(txin.prevout.hash);
-
-                int64 nValueIn = coins.vout[txin.prevout.n].nValue;
-                nTotalIn += nValueIn;
-
-                int nConf = pindexPrev->nHeight - coins.nHeight + 1;
-
-                dPriority += (double)nValueIn * nConf;
-            }
-            if (fMissingInputs) continue;
-
-            // Priority is sum(valuein * age) / txsize
-            unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
-            dPriority /= nTxSize;
-
-            // This is a more accurate fee-per-kilobyte than is used by the client code, because the
-            // client code rounds up the size to the nearest 1K. That's good, because it gives an
-            // incentive to create smaller transactions.
-            double dFeePerKb =  double(nTotalIn-tx.GetValueOut()) / (double(nTxSize)/1000.0);
-
-            if (porphan)
-            {
-                porphan->dPriority = dPriority;
-                porphan->dFeePerKb = dFeePerKb;
-            }
-            else
-                vecPriority.push_back(TxPriority(dPriority, dFeePerKb, &(*mi).second));
-        }
-
-        // Collect transactions into block
-        uint64 nBlockSize = 1000;
-        uint64 nBlockTx = 0;
-        int nBlockSigOps = 100;
-        bool fSortedByFee = (nBlockPrioritySize <= 0);
-
-        TxPriorityCompare comparer(fSortedByFee);
-        std::make_heap(vecPriority.begin(), vecPriority.end(), comparer);
-
-        while (!vecPriority.empty())
-        {
-            // Take highest priority transaction off the priority queue:
-            double dPriority = vecPriority.front().get<0>();
-            double dFeePerKb = vecPriority.front().get<1>();
-            CTransaction& tx = *(vecPriority.front().get<2>());
-
-            std::pop_heap(vecPriority.begin(), vecPriority.end(), comparer);
-            vecPriority.pop_back();
-
-            // Size limits
-            unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
-            if (nBlockSize + nTxSize >= nBlockMaxSize)
-                continue;
-
-            // Legacy limits on sigOps:
-            unsigned int nTxSigOps = tx.GetLegacySigOpCount();
-            if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
-                continue;
-
-            // Skip free transactions if we're past the minimum block size:
-            if (fSortedByFee && (dFeePerKb < CTransaction::nMinTxFee) && (nBlockSize + nTxSize >= nBlockMinSize))
-                continue;
-
-            // Prioritize by fee once past the priority size or we run out of high-priority
-            // transactions:
-            if (!fSortedByFee &&
-                ((nBlockSize + nTxSize >= nBlockPrioritySize) || (dPriority < COIN * 576 / 250)))
-            {
-                fSortedByFee = true;
-                comparer = TxPriorityCompare(fSortedByFee);
-                std::make_heap(vecPriority.begin(), vecPriority.end(), comparer);
-            }
-
-            if (!tx.HaveInputs(view))
-                continue;
-
-            int64 nTxFees = tx.GetValueIn(view)-tx.GetValueOut();
-
-            nTxSigOps += tx.GetP2SHSigOpCount(view);
-            if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
-                continue;
-
-            CValidationState state;
-            if (!tx.CheckInputs(state, view, true, SCRIPT_VERIFY_P2SH))
-                continue;
-
-            CTxUndo txundo;
-            uint256 hash = tx.GetHash();
-            tx.UpdateCoins(state, view, txundo, pindexPrev->nHeight+1, hash);
-
-            // Added
-            pblock->vtx.push_back(tx);
-            pblocktemplate->vTxFees.push_back(nTxFees);
-            pblocktemplate->vTxSigOps.push_back(nTxSigOps);
-            nBlockSize += nTxSize;
-            ++nBlockTx;
-            nBlockSigOps += nTxSigOps;
-            nFees += nTxFees;
-
-            if (fPrintPriority)
-            {
-                printf("priority %.1f feeperkb %.1f txid %s\n",
-                       dPriority, dFeePerKb, tx.GetHash().ToString().c_str());
-            }
-
-            // Add transactions that depend on this one to the priority queue
-            if (mapDependers.count(hash))
-            {
-                BOOST_FOREACH(COrphan* porphan, mapDependers[hash])
-                {
-                    if (!porphan->setDependsOn.empty())
-                    {
-                        porphan->setDependsOn.erase(hash);
-                        if (porphan->setDependsOn.empty())
-                        {
-                            vecPriority.push_back(TxPriority(porphan->dPriority, porphan->dFeePerKb, porphan->ptx));
-                            std::push_heap(vecPriority.begin(), vecPriority.end(), comparer);
-                        }
-                    }
-                }
-            }
-        }
-
-        nLastBlockTx = nBlockTx;
-        nLastBlockSize = nBlockSize;
-        printf("CreateNewBlock(): total size %"PRI64u"\n", nBlockSize);
-
-        pblock->vtx[0].vout[0].nValue = GetBlockValue(pindexPrev->nHeight+1, nFees);
-        pblocktemplate->vTxFees[0] = -nFees;
-
-        // Fill in header
-        pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
-        pblock->UpdateTime(pindexPrev);
-        pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock);
-        pblock->nNonce         = 0;
-        pblock->vtx[0].vin[0].scriptSig = CScript() << OP_0 << OP_0;
-        pblocktemplate->vTxSigOps[0] = pblock->vtx[0].GetLegacySigOpCount();
-
-        CBlockIndex indexDummy(*pblock);
-        indexDummy.pprev = pindexPrev;
-        indexDummy.nHeight = pindexPrev->nHeight + 1;
-        CCoinsViewCache viewNew(*pcoinsTip, true);
-        CValidationState state;
-        if (!pblock->ConnectBlock(state, &indexDummy, viewNew, true))
-            throw std::runtime_error("CreateNewBlock() : ConnectBlock failed");
-    }
-
-    return pblocktemplate.release();
-}
-
-CBlockTemplate* CreateNewBlockWithKey(CReserveKey& reservekey)
-{
-    CPubKey pubkey;
-    if (!reservekey.GetReservedKey(pubkey))
-        return NULL;
-
-    CScript scriptPubKey = CScript() << pubkey << OP_CHECKSIG;
-    return CreateNewBlock(scriptPubKey);
-}
-
-void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce)
-{
-    // Update nExtraNonce
-    static uint256 hashPrevBlock;
-    if (hashPrevBlock != pblock->hashPrevBlock)
-    {
-        nExtraNonce = 0;
-        hashPrevBlock = pblock->hashPrevBlock;
-    }
-    ++nExtraNonce;
-    unsigned int nHeight = pindexPrev->nHeight+1; // Height first in coinbase required for block.version=2
-    pblock->vtx[0].vin[0].scriptSig = (CScript() << nHeight << CBigNum(nExtraNonce)) + COINBASE_FLAGS;
-    assert(pblock->vtx[0].vin[0].scriptSig.size() <= 100);
-
-    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
-}
-
-
-void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash1)
-{
-    //
-    // Pre-build hash buffers
-    //
-    struct
-    {
-        struct unnamed2
-        {
-            int nVersion;
-            uint256 hashPrevBlock;
-            uint256 hashMerkleRoot;
-            unsigned int nTime;
-            unsigned int nBits;
-            unsigned int nNonce;
-        }
-        block;
-        unsigned char pchPadding0[64];
-        uint256 hash1;
-        unsigned char pchPadding1[64];
-    }
-    tmp;
-    memset(&tmp, 0, sizeof(tmp));
-
-    tmp.block.nVersion       = pblock->nVersion;
-    tmp.block.hashPrevBlock  = pblock->hashPrevBlock;
-    tmp.block.hashMerkleRoot = pblock->hashMerkleRoot;
-    tmp.block.nTime          = pblock->nTime;
-    tmp.block.nBits          = pblock->nBits;
-    tmp.block.nNonce         = pblock->nNonce;
-
-    FormatHashBlocks(&tmp.block, sizeof(tmp.block));
-    FormatHashBlocks(&tmp.hash1, sizeof(tmp.hash1));
-
-    // Byte swap all the input buffer
-    for (unsigned int i = 0; i < sizeof(tmp)/4; i++)
-        ((unsigned int*)&tmp)[i] = ByteReverse(((unsigned int*)&tmp)[i]);
-
-    // Precalc the first half of the first hash, which stays constant
-    SHA256Transform(pmidstate, &tmp.block, pSHA256InitState);
-
-    memcpy(pdata, &tmp.block, 128);
-    memcpy(phash1, &tmp.hash1, 64);
-}
-
-
-bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
-{
-    uint256 hash = pblock->GetPoWHash();
-    uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
-
-    if (hash > hashTarget)
-        return false;
-
-    //// debug print
-    printf("hempcoinMiner:\n");
-    printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
-    pblock->print();
-    printf("generated %s\n", FormatMoney(pblock->vtx[0].vout[0].nValue).c_str());
-
-    // Found a solution
-    {
-        LOCK(cs_main);
-        if (pblock->hashPrevBlock != hashBestChain)
-            return error("hempcoinMiner : generated block is stale");
-
-        // Remove key from key pool
-        reservekey.KeepKey();
-
-        // Track how many getdata requests this block gets
-        {
-            LOCK(wallet.cs_wallet);
-            wallet.mapRequestCount[pblock->GetHash()] = 0;
-        }
-
-        // Process this block the same as if we had received it from another node
-        CValidationState state;
-        if (!ProcessBlock(state, NULL, pblock))
-            return error("hempcoinMiner : ProcessBlock, block not accepted");
-    }
-
-    return true;
-}
-
-void static hempcoinMiner(CWallet *pwallet)
-{
-    printf("hempcoinMiner started\n");
-    SetThreadPriority(THREAD_PRIORITY_LOWEST);
-    RenameThread("hempcoin-miner");
-
-    // Each thread has its own key and counter
-    CReserveKey reservekey(pwallet);
-    unsigned int nExtraNonce = 0;
-
-    try { loop {
-        while (vNodes.empty())
-            MilliSleep(1000);
-
-        //
-        // Create new block
-        //
-        unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
-        CBlockIndex* pindexPrev = pindexBest;
-
-        auto_ptr<CBlockTemplate> pblocktemplate(CreateNewBlockWithKey(reservekey));
-        if (!pblocktemplate.get())
-            return;
-        CBlock *pblock = &pblocktemplate->block;
-        IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
-
-        printf("Running hempcoinMiner with %"PRIszu" transactions in block (%u bytes)\n", pblock->vtx.size(),
-               ::GetSerializeSize(*pblock, SER_NETWORK, PROTOCOL_VERSION));
-
-        //
-        // Pre-build hash buffers
-        //
-        char pmidstatebuf[32+16]; char* pmidstate = alignup<16>(pmidstatebuf);
-        char pdatabuf[128+16];    char* pdata     = alignup<16>(pdatabuf);
-        char phash1buf[64+16];    char* phash1    = alignup<16>(phash1buf);
-
-        FormatHashBuffers(pblock, pmidstate, pdata, phash1);
-
-        unsigned int& nBlockTime = *(unsigned int*)(pdata + 64 + 4);
-        unsigned int& nBlockBits = *(unsigned int*)(pdata + 64 + 8);
-        //unsigned int& nBlockNonce = *(unsigned int*)(pdata + 64 + 12);
-
-
-        //
-        // Search
-        //
-        int64 nStart = GetTime();
-        uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
-        loop
-        {
-            unsigned int nHashesDone = 0;
-
-            uint256 thash;
-            
-            unsigned long int scrypt_scratpad_size_current_block = ((1 << (GetNfactor(pblock->nTime) + 1)) * 128 ) + 63;
-            
-            char scratchpad[scrypt_scratpad_size_current_block];
-            
-            /*printf("nTime -> %d", pblock->nTime);
-            printf("scrypt_scratpad_size_current_block -> %ld", sizeof(scrypt_scratpad_size_current_block));
-            printf("scratchpad -> %d", sizeof(scratchpad));*/
-            
-            loop
-            {
-
-                // Generic scrypt
-                scrypt_N_1_1_256_sp_generic(BEGIN(pblock->nVersion), BEGIN(thash), scratchpad, GetNfactor(pblock->nTime));
-
-
-                if (thash <= hashTarget)
-                {
-                    // Found a solution
-                    printf("Entering to found a solution section");
-                    SetThreadPriority(THREAD_PRIORITY_NORMAL);
-                    CheckWork(pblock, *pwallet, reservekey);
-                    SetThreadPriority(THREAD_PRIORITY_LOWEST);
-                    break;
-                }
-                pblock->nNonce += 1;
-                nHashesDone += 1;
-                if ((pblock->nNonce & 0xFF) == 0)
-                    break;
-            }
-
-            // Meter hashes/sec
-            static int64 nHashCounter;
-            if (nHPSTimerStart == 0)
-            {
-                nHPSTimerStart = GetTimeMillis();
-                nHashCounter = 0;
-            }
-            else
-                nHashCounter += nHashesDone;
-            if (GetTimeMillis() - nHPSTimerStart > 4000)
-            {
-                static CCriticalSection cs;
-                {
-                    LOCK(cs);
-                    if (GetTimeMillis() - nHPSTimerStart > 4000)
-                    {
-                        dHashesPerSec = 1000.0 * nHashCounter / (GetTimeMillis() - nHPSTimerStart);
-                        nHPSTimerStart = GetTimeMillis();
-                        nHashCounter = 0;
-                        static int64 nLogTime;
-                        if (GetTime() - nLogTime > 30 * 60)
-                        {
-                            nLogTime = GetTime();
-                            printf("hashmeter %6.0f khash/s\n", dHashesPerSec/1000.0);
-                        }
-                    }
-                }
-            }
-
-            // Check for stop or if block needs to be rebuilt
-            boost::this_thread::interruption_point();
-            if (vNodes.empty())
-                break;
-            if (pblock->nNonce >= 0xffff0000)
-                break;
-            if (nTransactionsUpdated != nTransactionsUpdatedLast && GetTime() - nStart > 60)
-                break;
-            if (pindexPrev != pindexBest)
-                break;
-
-            // Update nTime every few seconds
-            pblock->UpdateTime(pindexPrev);
-            nBlockTime = ByteReverse(pblock->nTime);
-            if (fTestNet)
-            {
-                // Changing pblock->nTime can change work required on testnet:
-                nBlockBits = ByteReverse(pblock->nBits);
-                hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
-            }
-        }
-    } }
-    catch (boost::thread_interrupted)
-    {
-        printf("hempcoinMiner terminated\n");
-        throw;
-    }
-}
-
-void GenerateBitcoins(bool fGenerate, CWallet* pwallet)
-{
-    static boost::thread_group* minerThreads = NULL;
-
-    int nThreads = GetArg("-genproclimit", -1);
-    if (nThreads < 0)
-        nThreads = boost::thread::hardware_concurrency();
-
-    if (minerThreads != NULL)
-    {
-        minerThreads->interrupt_all();
-        delete minerThreads;
-        minerThreads = NULL;
-    }
-
-    if (nThreads == 0 || !fGenerate)
-        return;
-
-    minerThreads = new boost::thread_group();
-    for (int i = 0; i < nThreads; i++)
-        minerThreads->create_thread(boost::bind(&hempcoinMiner, pwallet));
-}
 
 // Amount compression:
 // * If the amount is 0, output 0

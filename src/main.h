@@ -25,6 +25,8 @@ class CNode;
 
 struct CBlockIndexWorkComparator;
 
+typedef std::vector<unsigned char> valtype;
+
 /** The maximum allowed size for a serialized block, in bytes (network rule) */
 static const unsigned int MAX_BLOCK_SIZE = 1000000;                      // 1000KB block hard limit
 /** Obsolete: maximum size for mined blocks */
@@ -67,15 +69,19 @@ static const int fHaveUPnP = true;
 #else
 static const int fHaveUPnP = false;
 #endif
+/** block that symbolizes the end of PoW **/
+const int CUTOFF_HEIGHT = 279000; // scruffy: start POS after 09-10-2016
+const unsigned int CUTOFF_TIME = 1471003078;
 
 
+extern const int64 nTargetTimespan;
+extern const int64 nTargetSpacing;
+extern const int64 nInterval;
+extern const int64 nStakeTargetSpacing;
+extern int nStakeMinAge;
+extern int nStakeMaxAge;
+extern unsigned int nModifierInterval;
 extern CScript COINBASE_FLAGS;
-
-
-
-
-
-
 extern CCriticalSection cs_main;
 extern std::map<uint256, CBlockIndex*> mapBlockIndex;
 extern std::set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexValid;
@@ -121,6 +127,7 @@ class CCoinsView;
 class CCoinsViewCache;
 class CScriptCheck;
 class CValidationState;
+class CWalletTx;
 
 struct CBlockTemplate;
 
@@ -158,17 +165,6 @@ bool ProcessMessages(CNode* pfrom);
 bool SendMessages(CNode* pto, bool fSendTrickle);
 /** Run an instance of the script checking thread */
 void ThreadScriptCheck();
-/** Run the miner threads */
-void GenerateBitcoins(bool fGenerate, CWallet* pwallet);
-/** Generate a new block, without valid proof-of-work */
-CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn);
-CBlockTemplate* CreateNewBlockWithKey(CReserveKey& reservekey);
-/** Modify the extranonce in a block */
-void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce);
-/** Do mining precalculation */
-void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash1);
-/** Check mined block */
-bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey);
 /** Check whether a block hash satisfies the proof-of-work requirement specified by nBits */
 bool CheckProofOfWork(uint256 hash, unsigned int nBits);
 /** Calculate the minimum amount of work a received block needs, without knowing its direct parent */
@@ -189,6 +185,7 @@ bool ConnectBestBlock(CValidationState &state);
 CBlockIndex * InsertBlockIndex(uint256 hash);
 /** Verify a signature */
 bool VerifySignature(const CCoins& txFrom, const CTransaction& txTo, unsigned int nIn, unsigned int flags, int nHashType);
+bool VerifySignature(const CWalletTx& txFrom, const CTransaction& txTo, unsigned int nIn, bool fValidatePayToScriptHash, int nHashType);
 /** Abort with a message */
 bool AbortNode(const std::string &msg);
 
@@ -430,6 +427,17 @@ public:
         return (nValue == -1);
     }
 
+    void SetEmpty()
+    {
+        nValue = 0;
+        scriptPubKey.clear();
+    }
+
+    bool IsEmpty() const
+    {
+        return (nValue == 0 && scriptPubKey.empty());
+    }
+
     uint256 GetHash() const
     {
         return SerializeHash(*this);
@@ -477,10 +485,15 @@ public:
     static int64 nMinTxFee;
     static int64 nMinRelayTxFee;
     static const int CURRENT_VERSION=1;
+    unsigned int nTime;
     int nVersion;
     std::vector<CTxIn> vin;
     std::vector<CTxOut> vout;
     unsigned int nLockTime;
+
+    // Denial-of-service detection:
+    mutable int nDoS;
+    bool DoS(int nDoSIn, bool fIn) const { nDoS += nDoSIn; return fIn; }
 
     CTransaction()
     {
@@ -495,6 +508,12 @@ public:
         READWRITE(vout);
         READWRITE(nLockTime);
     )
+
+    bool IsCoinStake() const
+    {
+        // hempcoin: the coin stake transaction is marked with the first output empty
+        return (vin.size() > 0 && (!vin[0].prevout.IsNull()) && vout.size() >= 2 && vout[0].IsEmpty());
+    }
 
     void SetNull()
     {
@@ -629,8 +648,8 @@ public:
         return dPriority > COIN * 576 / 250;
     }
 
-// Apply the effects of this transaction on the UTXO set represented by view
-void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCache &inputs, CTxUndo &txundo, int nHeight, const uint256 &txhash);
+    // Apply the effects of this transaction on the UTXO set represented by view
+    void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCache &inputs, CTxUndo &txundo, int nHeight, const uint256 &txhash);
 
     int64 GetMinFee(unsigned int nBlockSize=1, bool fAllowFree=true, enum GetMinFee_mode mode=GMF_BLOCK) const;
 
@@ -676,7 +695,7 @@ void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCach
     // Check whether all inputs of this transaction are valid (no double spends, scripts & sigs, amounts)
     // This does not modify the UTXO set. If pvChecks is not NULL, script checks are pushed onto it
     // instead of being performed inline.
-    bool CheckInputs(CValidationState &state, CCoinsViewCache &view, bool fScriptChecks = true,
+    bool CheckInputs(CValidationState &state, CCoinsViewCache &view, const CBlockIndex *pindexBlock, bool fScriptChecks = true,
                      unsigned int flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC,
                      std::vector<CScriptCheck> *pvChecks = NULL) const;
 
@@ -689,6 +708,7 @@ void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCach
     // Try to accept this transaction into the memory pool
     bool AcceptToMemoryPool(CValidationState &state, bool fCheckInputs=true, bool fLimitFree = true, bool* pfMissingInputs=NULL, bool fRejectInsaneFee = false);
 
+    uint64 GetCoinAge(CCoinsViewCache &inputs) const;
 protected:
     static const CTxOut &GetOutputFor(const CTxIn& input, CCoinsViewCache& mapInputs);
 };
@@ -1288,7 +1308,7 @@ class CBlockHeader
 {
 public:
     // header
-    static const int CURRENT_VERSION=3;
+    static const int CURRENT_VERSION=5;
     int nVersion;
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;
@@ -1345,7 +1365,8 @@ class CBlock : public CBlockHeader
 public:
     // network and disk
     std::vector<CTransaction> vtx;
-
+    // hempcoin: block signature - signed by one of the coin base txout[N]'s owner
+    std::vector<unsigned char> vchBlockSig;
     // memory only
     mutable std::vector<uint256> vMerkleTree;
 
@@ -1378,6 +1399,34 @@ public:
         uint256 thash;
         scrypt_N_1_1_256(BEGIN(nVersion), BEGIN(thash), GetNfactor(nTime));
         return thash;
+    }
+
+    // entropy bit for stake modifier if chosen by modifier
+    unsigned int GetStakeEntropyBit(unsigned int nHeight) const
+    {
+        // Take last bit of block hash as entropy bit
+        unsigned int nEntropyBit = static_cast<unsigned int>((GetHash().Get64()) & uint64(1));
+        if (fDebug && GetBoolArg("-printstakemodifier"))
+            printf("GetStakeEntropyBit: nHeight=%u, hashBlock=%s nEntropyBit=%u\n",nHeight, GetHash().ToString().c_str(), nEntropyBit);
+        return nEntropyBit;
+    }
+
+    // there are two types of block: proof-of-work or proof-of-stake
+    bool IsProofOfStake() const
+    {
+        return (vtx.size() > 1 && vtx[1].IsCoinStake());
+    }
+
+    bool IsProofOfWork() const
+    {
+        return !IsProofOfStake();
+    }
+
+    std::pair<COutPoint, unsigned int> GetProofOfStake() const
+    {
+        return IsProofOfStake()?
+                    std::make_pair(vtx[1].vin[0].prevout, vtx[1].nTime) :
+                    std::make_pair(COutPoint(), (unsigned int)0);
     }
 
     CBlockHeader GetBlockHeader() const
@@ -1544,6 +1593,11 @@ public:
     // Store block on disk
     // if dbp is provided, the file is known to already reside on disk
     bool AcceptBlock(CValidationState &state, CDiskBlockPos *dbp = NULL);
+
+
+    // some check functions for PoS
+    bool SignScryptBlock(const CKeyStore& keystore);
+    bool CheckBlockSignature() const;
 };
 
 
@@ -1669,6 +1723,23 @@ public:
     // Verification status of this block. See enum BlockStatus
     unsigned int nStatus;
 
+
+    unsigned int nFlags;  // ppcoin: block index flags
+    enum
+    {
+        BLOCK_PROOF_OF_STAKE = (1 << 0), // is proof-of-stake block
+        BLOCK_STAKE_ENTROPY  = (1 << 1), // entropy bit for stake modifier
+        BLOCK_STAKE_MODIFIER = (1 << 2), // regenerated stake modifier
+    };
+
+    uint64_t nStakeModifier; // hash modifier for proof-of-stake
+    unsigned int nStakeModifierChecksum; // checksum of index; in-memeory only
+
+    // proof-of-stake specific fields
+    COutPoint prevoutStake;
+    unsigned int nStakeTime;
+    uint256 hashProofOfStake;
+
     // block header
     int nVersion;
     uint256 hashMerkleRoot;
@@ -1691,6 +1762,12 @@ public:
         nChainTx = 0;
         nStatus = 0;
 
+        nStakeModifier = 0;
+        nStakeModifierChecksum = 0;
+        hashProofOfStake = 0;
+        prevoutStake.SetNull();
+        nStakeTime = 0;
+
         nVersion       = 0;
         hashMerkleRoot = 0;
         nTime          = 0;
@@ -1698,7 +1775,7 @@ public:
         nNonce         = 0;
     }
 
-    CBlockIndex(CBlockHeader& block)
+    CBlockIndex(CBlock& block)
     {
         phashBlock = NULL;
         pprev = NULL;
@@ -1711,6 +1788,21 @@ public:
         nTx = 0;
         nChainTx = 0;
         nStatus = 0;
+
+        nStakeModifier = 0;
+        nStakeModifierChecksum = 0;
+        hashProofOfStake = 0;
+        if (block.IsProofOfStake())
+        {
+            SetProofOfStake();
+            prevoutStake = block.vtx[1].vin[0].prevout;
+            nStakeTime = block.vtx[1].nTime;
+        }
+        else
+        {
+            prevoutStake.SetNull();
+            nStakeTime = 0;
+        }
 
         nVersion       = block.nVersion;
         hashMerkleRoot = block.hashMerkleRoot;
@@ -1758,6 +1850,46 @@ public:
     int64 GetBlockTime() const
     {
         return (int64)nTime;
+    }
+
+    bool IsProofOfWork() const
+    {
+        return !(nFlags & BLOCK_PROOF_OF_STAKE);
+    }
+
+    bool IsProofOfStake() const
+    {
+        return (nFlags & BLOCK_PROOF_OF_STAKE);
+    }
+
+    void SetProofOfStake()
+    {
+        nFlags |= BLOCK_PROOF_OF_STAKE;
+    }
+
+    unsigned int GetStakeEntropyBit() const
+    {
+        return ((nFlags & BLOCK_STAKE_ENTROPY) >> 1);
+    }
+
+    bool SetStakeEntropyBit(unsigned int nEntropyBit)
+    {
+        if (nEntropyBit > 1)
+            return false;
+        nFlags |= (nEntropyBit? BLOCK_STAKE_ENTROPY : 0);
+        return true;
+    }
+
+    bool GeneratedStakeModifier() const
+    {
+        return (nFlags & BLOCK_STAKE_MODIFIER);
+    }
+
+    void SetStakeModifier(uint64_t nModifier, bool fGeneratedStakeModifier)
+    {
+        nStakeModifier = nModifier;
+        if (fGeneratedStakeModifier)
+            nFlags |= BLOCK_STAKE_MODIFIER;
     }
 
     CBigNum GetBlockWork() const
@@ -2293,5 +2425,12 @@ public:
         READWRITE(txn);
     )
 };
+
+
+int64 GetBlockValue(int nHeight, int64 nFees);
+unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, bool IsPoW);
+const CBlockIndex* GetLastBlockIndex(const CBlockIndex* pindex, bool fProofOfStake);
+
+int64 GetProofOfStakeReward(int64 nCoinAge, unsigned int nBits, int nHeight);
 
 #endif
