@@ -237,7 +237,9 @@ HEADERS += src/qt/bitcoingui.h \
     src/threadsafety.h \
     src/limitedmap.h \
     src/qt/macnotificationhandler.h \
-    src/qt/splashscreen.h
+    src/qt/splashscreen.h \
+    src/miner.h \
+    src/scrypt_kernel.h
 
 SOURCES += src/qt/bitcoin.cpp \
     src/qt/bitcoingui.cpp \
@@ -308,7 +310,9 @@ SOURCES += src/qt/bitcoin.cpp \
     src/noui.cpp \
     src/leveldb.cpp \
     src/txdb.cpp \
-    src/qt/splashscreen.cpp
+    src/qt/splashscreen.cpp \
+    src/miner.cpp \
+    src/scrypt_kernel.cpp
 
 RESOURCES += src/qt/bitcoin.qrc
 
@@ -389,7 +393,7 @@ isEmpty(BOOST_LIB_SUFFIX) {
 }
 
 isEmpty(BOOST_THREAD_LIB_SUFFIX) {
-    BOOST_THREAD_LIB_SUFFIX =-mgw48-mt-s-1_54#$$BOOST_LIB_SUFFIX
+    win32:BOOST_THREAD_LIB_SUFFIX =-mgw48-mt-s-1_54#$$BOOST_LIB_SUFFIX
 }
 
 isEmpty(BDB_LIB_PATH) {
